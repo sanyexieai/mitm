@@ -1,0 +1,291 @@
+import { Button, VerticalBox, ListView, CheckBox, TabWidget } from "std-widgets.slint";
+
+export struct RequestInfo {
+    method: string,
+    url: string,
+    app: string,
+    status: string,
+    server_ip: string,
+    duration: string,
+    size: string,
+    timestamp: string,
+    raw_request: string,
+    request_headers: string,
+    request_body: string,
+    raw_response: string,
+    response_headers: string,
+    response_body: string,
+}
+
+export component MainWindow inherits Window {
+    width: 1200px;
+    height: 800px;
+    title: "MITM Proxy";
+
+    in-out property <bool> is_listening: false;
+    in-out property <bool> listen_loopback: false;
+    in-out property <[RequestInfo]> requests: [];
+    in-out property <int> selected_request: -1;
+
+    callback toggle-listening();
+
+    VerticalLayout {
+        spacing: 0px;
+        padding: 0px;
+
+        HorizontalLayout {
+            height: 50px;
+            alignment: end;
+            padding: 10px;
+            spacing: 10px;
+
+            CheckBox {
+                text: "监听本地回环";
+                checked: root.listen_loopback;
+                toggled => {
+                    root.listen_loopback = self.checked;
+                }
+            }
+
+            Button {
+                text: root.is_listening ? "停止监听" : "开始监听";
+                clicked => {
+                    root.toggle-listening();
+                }
+            }
+        }
+
+        HorizontalLayout {
+            Rectangle {
+                width: root.selected_request >= 0 ? 400px : root.width;
+                animate width { duration: 200ms; }
+                background: #ffffff;
+                border-width: 1px;
+                border-color: #e0e0e0;
+
+                VerticalLayout {
+                    Rectangle {
+                        height: 40px;
+                        background: #f5f5f5;
+
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 8px;
+
+                            Text {
+                                text: "方法";
+                                width: 60px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "URL";
+                                width: 200px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "应用";
+                                width: 80px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "状态";
+                                width: 80px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "服务器";
+                                width: 120px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "时长";
+                                width: 60px;
+                                font-weight: 700;
+                            }
+                            Text {
+                                text: "大小";
+                                width: 60px;
+                                font-weight: 700;
+                            }
+                        }
+                    }
+
+                    ListView {
+                        for request[i] in requests: Rectangle {
+                            height: 40px;
+                            background: i == root.selected_request ? #e6f3ff : #ffffff;
+                            
+                            TouchArea {
+                                clicked => {
+                                    if (i == root.selected_request) {
+                                        root.selected_request = -1;
+                                    } else {
+                                        root.selected_request = i;
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+
+                                    Text {
+                                        text: request.method;
+                                        width: 60px;
+                                        color: #000000;
+                                        font-size: 14px;
+                                        font-weight: 700;
+                                    }
+                                    Text {
+                                        text: request.url;
+                                        width: 200px;
+                                        horizontal-alignment: left;
+                                    }
+                                    Text {
+                                        text: request.app;
+                                        width: 80px;
+                                    }
+                                    Text {
+                                        text: request.status;
+                                        width: 80px;
+                                    }
+                                    Text {
+                                        text: request.server_ip;
+                                        width: 120px;
+                                    }
+                                    Text {
+                                        text: request.duration;
+                                        width: 60px;
+                                    }
+                                    Text {
+                                        text: request.size;
+                                        width: 60px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.selected_request >= 0 : Rectangle {
+                background: #ffffff;
+                border-width: 1px;
+                border-color: #e0e0e0;
+
+                VerticalLayout {
+                    HorizontalLayout {
+                        height: 40px;
+                        padding-right: 8px;
+                        alignment: end;
+
+                        TouchArea {
+                            width: 32px;
+                            height: 32px;
+                            clicked => {
+                                root.selected_request = -1;
+                            }
+
+                            Rectangle {
+                                width: 24px;
+                                height: 24px;
+                                background: #f0f0f0;
+                                border-radius: 4px;
+
+                                Text {
+                                    text: "×";
+                                    color: #666666;
+                                    font-size: 16px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    TabWidget {
+                        Tab {
+                            title: "总览";
+                            VerticalLayout {
+                                padding: 16px;
+                                spacing: 8px;
+                                Text { text: "URL: " + requests[root.selected_request].url; }
+                                Text { text: "方法: " + requests[root.selected_request].method; }
+                                Text { text: "状态: " + requests[root.selected_request].status; }
+                                Text { text: "应用: " + requests[root.selected_request].app; }
+                                Text { text: "服务器: " + requests[root.selected_request].server_ip; }
+                                Text { text: "时长: " + requests[root.selected_request].duration; }
+                                Text { text: "大小: " + requests[root.selected_request].size; }
+                            }
+                        }
+                        Tab {
+                            title: "原始请求";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].raw_request;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Tab {
+                            title: "请求头";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].request_headers;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Tab {
+                            title: "请求体";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].request_body;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Tab {
+                            title: "原始响应";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].raw_response;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Tab {
+                            title: "响应头";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].response_headers;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                        Tab {
+                            title: "响应体";
+                            VerticalLayout {
+                                padding: 16px;
+                                Text {
+                                    text: requests[root.selected_request].response_body;
+                                    font-family: "monospace";
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
