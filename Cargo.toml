@@ -11,7 +11,7 @@ winreg = "0.50"
 dirs = "5.0"
 httparse = "1.8"
 local-ip-address = "0.5"
-hudsucker = { version = "0.23", features = ["openssl-ca"] }
+hudsucker = { version = "0.23", features = ["rcgen-ca"] }
 http = "0.2"
 async-trait = "0.1"
 tracing = "0.1"

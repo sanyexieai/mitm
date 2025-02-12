@@ -12,11 +12,10 @@ use local_ip_address;
 use std::time::{Instant, Duration};
 use tokio::io::AsyncWriteExt;
 use hudsucker::{
-    certificate_authority::OpensslAuthority,
+    certificate_authority::RcgenAuthority,
     HttpContext, HttpHandler, WebSocketHandler, WebSocketContext,
     builder::ProxyBuilder,
     Body, RequestOrResponse,
-    openssl::{hash::MessageDigest, pkey::PKey, x509::X509},
     Proxy,
 };
 use http::{Request, Response};
@@ -193,25 +192,16 @@ fn get_app_name(user_agent: &str) -> String {
 }
 
 async fn start_proxy(weak: slint::Weak<MainWindow>, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-    // 从文件加载证书和私钥
-    let private_key_bytes = include_bytes!("ca/hudsucker.key");
-    let ca_cert_bytes = include_bytes!("ca/hudsucker.cer");
-    
-    let private_key = PKey::private_key_from_pem(private_key_bytes)?;
-    let ca_cert = X509::from_pem(ca_cert_bytes)?;
-
-    let ca = OpensslAuthority::new(
-        private_key,
-        ca_cert,
-        MessageDigest::sha256(),
-        1_000,
-        aws_lc_rs::default_provider(),
-    );
+    let ca = RcgenAuthority::new(
+        "MITM Proxy CA",
+        "MITM Proxy",
+        vec!["MITM Proxy Root CA".to_string()],
+        Duration::from_secs(365 * 24 * 60 * 60),
+    )?;
 
     let proxy = Proxy::builder()
         .with_addr(addr)
         .with_ca(ca)
-        .with_rustls_client(aws_lc_rs::default_provider())
         .with_http_handler(ProxyHandler { 
             weak,
             start_time: std::time::Instant::now(),
