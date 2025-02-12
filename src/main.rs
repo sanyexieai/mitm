@@ -3,24 +3,28 @@ use slint::SharedString;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::net::TcpListener;
-use slint::{VecModel, Model};
+use slint::{VecModel, Model, ComponentHandle};
 use winreg::enums::*;
 use winreg::RegKey;
-use tokio::io::AsyncReadExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, SanType};
-use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
 use std::net::ToSocketAddrs;
 use local_ip_address;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use tokio::io::AsyncWriteExt;
-slint::include_modules!();
+use hudsucker::{
+    certificate_authority::OpensslAuthority,
+    HttpContext, HttpHandler, WebSocketHandler, WebSocketContext,
+    builder::ProxyBuilder,
+    Body, RequestOrResponse,
+    openssl::{hash::MessageDigest, pkey::PKey, x509::X509},
+    Proxy,
+};
+use http::{Request, Response};
+use tokio_tungstenite::tungstenite::Message;
+use async_trait::async_trait;
+use tracing::*;
 
-// 从 Slint 生成的类型
-use slint::ComponentHandle;
+slint::include_modules!();
 
 // 添加全局变量保存原始代理状态
 static ORIGINAL_PROXY_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -69,258 +73,173 @@ fn set_system_proxy(enable: bool, proxy_addr: Option<String>, save_original: boo
 }
 
 #[derive(Clone)]
-struct Proxy {
+struct ProxyState {
     window: slint::Weak<MainWindow>,
-    listener: Option<Arc<Mutex<TcpListener>>>,
     listen_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
-fn generate_ca_certificate() -> Result<(Certificate, PathBuf), Box<dyn std::error::Error>> {
-    let mut params = CertificateParams::default();
-    params.distinguished_name = DistinguishedName::new();
-    params.distinguished_name.push(DnType::CommonName, "MITM Proxy CA");
-    params.distinguished_name.push(DnType::OrganizationName, "MITM Proxy");
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-
-    let cert = Certificate::from_params(params)?;
-    
-    // 保存证书到用户目录
-    let cert_path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("mitm-proxy")
-        .join("ca.crt");
-
-    fs::create_dir_all(cert_path.parent().unwrap())?;
-    fs::write(&cert_path, cert.serialize_pem()?)?;
-
-    Ok((cert, cert_path))
-}
-
-fn install_certificate(cert_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    // 使用 Windows 证书工具安装证书
-    let status = Command::new("certutil")
-        .args(&["-addstore", "ROOT", cert_path.to_str().unwrap()])
-        .status()?;
-
-    if !status.success() {
-        return Err("Failed to install certificate".into());
-    }
-    println!("证书已安装");
-    Ok(())
-}
-
-fn check_and_install_certificate() -> Result<Certificate, Box<dyn std::error::Error>> {
-    let cert_path = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("mitm-proxy")
-        .join("ca.crt");
-
-    let cert = if cert_path.exists() {
-        let cert_pem = fs::read_to_string(&cert_path)?;
-        let params = CertificateParams::new(vec!["MITM Proxy CA".to_string()]);
-        Certificate::from_params(params)?
-    } else {
-        let (cert, path) = generate_ca_certificate()?;
-        install_certificate(&path)?;
-        cert
-    };
-
-    Ok(cert)
-}
-
-async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
-    addr: SocketAddr,
-    ca_cert: Arc<Certificate>,
+#[derive(Clone)]
+struct ProxyHandler {
     weak: slint::Weak<MainWindow>,
-) -> Result<(), std::io::Error> {
-    let start_time = Instant::now();
-    let mut buffer = [0; 4096];
-    let n = stream.peek(&mut buffer).await?;  // 只是peek，没有实际读取数据
-    
-    // 我们需要实际读取和转发数据
-    let mut server_stream = None;
-    
-    let mut domain_info = String::new();
-    let mut request_path = String::new();
-    let mut method = String::new();
-    let mut status = String::new();
-    let mut app = String::new();
-    let mut server_ip = String::new();
-    
-    // 检测是否是 TLS 连接
-    let is_tls = n >= 3 && buffer[0] == 0x16 && buffer[1] == 0x03;
-    
-    if is_tls {
-        if let Ok(hostname) = get_sni_hostname(&buffer[..n]) {
-            domain_info = hostname.clone();
-            if let Ok(mut addrs) = format!("{}:443", hostname).to_socket_addrs() {
-                if let Some(addr) = addrs.next() {
-                    server_ip = addr.ip().to_string();
-                    println!("HTTPS 请求: {} -> {}", addr.ip(), hostname);
-                    if let Ok(server) = tokio::net::TcpStream::connect(addr).await {
-                        server_stream = Some(server);
-                    }
-                }
-            }
-            method = "HTTPS".to_string();
-            status = "Established".to_string();
-        }
-    } else {
-        let mut headers = [httparse::EMPTY_HEADER; 32];
-        let mut req = httparse::Request::new(&mut headers);
+    start_time: std::time::Instant,
+}
+
+#[async_trait::async_trait]
+impl HttpHandler for ProxyHandler {
+    async fn handle_request(
+        &mut self,
+        ctx: &HttpContext,
+        req: Request<Body>,
+    ) -> hudsucker::RequestOrResponse {
+        let method = req.method().to_string();
+        let url = req.uri().to_string();
+        let host = req.uri().host().unwrap_or("unknown").to_string();
+        let headers = format!("{:?}", req.headers());
         
-        if let Ok(parsed) = req.parse(&buffer[..n]) {
-            if parsed.is_complete() {
-                if let Some(m) = req.method {
-                    method = m.to_string();
-                }
-                if let Some(host) = req.headers.iter().find(|h| h.name.eq_ignore_ascii_case("host")) {
-                    domain_info = String::from_utf8_lossy(host.value).to_string();
-                }
-                if let Some(path) = req.path {
-                    request_path = path.to_string();
-                }
-                if let Some(user_agent) = req.headers.iter().find(|h| h.name.eq_ignore_ascii_case("user-agent")) {
-                    app = get_app_name(String::from_utf8_lossy(user_agent.value).as_ref());
-                }
-                status = "200 OK".to_string();  // 这里可以根据实际响应修改
+        // 更新UI
+        let weak = self.weak.clone();
+        let request_info = RequestInfo {
+            method: method.into(),
+            url: url.into(),
+            app: get_app_name(req.headers().get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("Unknown")).into(),
+            status: "Pending".into(),
+            server_ip: host.into(),
+            duration: "0.00s".into(),
+            size: "0B".into(),
+            timestamp: Local::now().format("%H:%M:%S").to_string().into(),
+            raw_request: format!("{:?}", req).into(),
+            request_headers: headers.into(),
+            request_body: "".into(),
+            raw_response: "".into(),
+            response_headers: "".into(),
+            response_body: "".into(),
+        };
+        
+        slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                let current_requests = window.get_requests();
+                let vec_model = current_requests.as_any()
+                    .downcast_ref::<VecModel<RequestInfo>>()
+                    .unwrap();
+                let mut vec = (0..vec_model.row_count())
+                    .map(|i| vec_model.row_data(i).unwrap())
+                    .collect::<Vec<_>>();
+                vec.push(request_info);
+                window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
             }
-        }
+        }).unwrap();
+
+        req.into()
     }
 
-    // 读取完整的请求
-    let mut request_data = Vec::new();
-    stream.read_to_end(&mut request_data).await?;
+    async fn handle_response(
+        &mut self,
+        ctx: &HttpContext,
+        res: Response<Body>,
+    ) -> Response<Body> {
+        let duration = self.start_time.elapsed();
+        let status = res.status().to_string();
+        let headers = format!("{:?}", res.headers());
+        
+        // 更新状态等信息
+        let weak = self.weak.clone();
+        slint::invoke_from_event_loop(move || {
+            if let Some(window) = weak.upgrade() {
+                // 更新最后一个请求的状态
+                let current_requests = window.get_requests();
+                let vec_model = current_requests.as_any()
+                    .downcast_ref::<VecModel<RequestInfo>>()
+                    .unwrap();
+                if let Some(mut last_request) = vec_model.row_data(vec_model.row_count() - 1) {
+                    last_request.status = status.into();
+                    last_request.duration = format!("{:.2}s", duration.as_secs_f32()).into();
+                    last_request.response_headers = headers.into();
+                    // 更新模型
+                    let mut vec = (0..vec_model.row_count() - 1)
+                        .map(|i| vec_model.row_data(i).unwrap())
+                        .collect::<Vec<_>>();
+                    vec.push(last_request);
+                    window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
+                }
+            }
+        }).unwrap();
 
-    // 如果有服务器连接，转发请求并读取响应
-    let response_data = if let Some(mut server) = server_stream {
-        server.write_all(&request_data).await?;
-        let mut response = Vec::new();
-        server.read_to_end(&mut response).await?;
-        response
-    } else {
-        Vec::new()
-    };
-
-    let duration = start_time.elapsed();
-    
-    // 更新 UI
-    slint::invoke_from_event_loop(move || {
-        if let Some(window) = weak.upgrade() {
-            let current_requests = window.get_requests();
-            let vec_model = current_requests.as_any()
-                .downcast_ref::<VecModel<RequestInfo>>()
-                .unwrap();
-            let mut vec = (0..vec_model.row_count())
-                .map(|i| vec_model.row_data(i).unwrap())
-                .collect::<Vec<_>>();
-            let request = RequestInfo {
-                method: SharedString::from(method),
-                url: SharedString::from(format!("{}{}", domain_info, request_path)),
-                app: SharedString::from(app),
-                status: SharedString::from(status),
-                server_ip: SharedString::from(server_ip),
-                duration: SharedString::from(format!("{:.2}s", duration.as_secs_f32())),
-                size: SharedString::from(format!("{}B", n)),
-                timestamp: SharedString::from(Local::now().format("%H:%M:%S").to_string()),
-                raw_request: SharedString::from(String::from_utf8_lossy(&request_data).to_string()),
-                request_headers: SharedString::from(format_headers(&request_data)),
-                request_body: SharedString::from(get_request_body(&request_data)),
-                raw_response: SharedString::from(String::from_utf8_lossy(&response_data).to_string()),
-                response_headers: SharedString::from(format_headers(&response_data)),
-                response_body: SharedString::from(get_request_body(&response_data)),
-            };
-            vec.push(request);
-            window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
-        }
-    }).unwrap();
-    
-    Ok(())
+        res
+    }
 }
 
-fn get_sni_hostname(data: &[u8]) -> Result<String, std::io::Error> {
-    // 简单的 SNI 解析
-    if data.len() < 5 {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "数据太短"));
+impl WebSocketHandler for ProxyHandler {
+    async fn handle_message(&mut self, _ctx: &WebSocketContext, msg: Message) -> Option<Message> {
+        println!("WebSocket消息: {:?}", msg);
+        Some(msg)
     }
-    
-    let mut pos = 5 + ((data[3] as usize) << 8 | data[4] as usize);
-    if data.len() < pos + 4 {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "数据不完整"));
-    }
-    
-    while pos + 4 <= data.len() {
-        let len = ((data[pos + 2] as usize) << 8) | data[pos + 3] as usize;
-        if data[pos] == 0 {
-            if let Ok(name) = String::from_utf8(data[pos + 4..pos + 4 + len].to_vec()) {
-                return Ok(name);
-            }
-        }
-        pos += 4 + len;
-    }
-    
-    Err(std::io::Error::new(std::io::ErrorKind::Other, "未找到 SNI"))
 }
 
-// 添加辅助函数来识别应用程序
 fn get_app_name(user_agent: &str) -> String {
-    let user_agent = user_agent.to_lowercase();
-    if user_agent.contains("chrome") {
+    let ua = user_agent.to_lowercase();
+    if ua.contains("chrome") {
         "Chrome".to_string()
-    } else if user_agent.contains("firefox") {
+    } else if ua.contains("firefox") {
         "Firefox".to_string()
-    } else if user_agent.contains("safari") {
+    } else if ua.contains("safari") {
         "Safari".to_string()
-    } else if user_agent.contains("edge") {
+    } else if ua.contains("edge") {
         "Edge".to_string()
     } else {
         "Unknown".to_string()
     }
 }
 
-// 添加辅助函数来格式化请求头
-fn format_headers(data: &[u8]) -> String {
-    let mut headers = String::new();
-    if let Ok(str_data) = String::from_utf8_lossy(data).to_string().parse::<String>() {
-        for line in str_data.lines() {
-            if line.is_empty() {
-                break;
-            }
-            headers.push_str(line);
-            headers.push('\n');
-        }
-    }
-    headers
-}
+async fn start_proxy(weak: slint::Weak<MainWindow>, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    // 从文件加载证书和私钥
+    let private_key_bytes = include_bytes!("ca/hudsucker.key");
+    let ca_cert_bytes = include_bytes!("ca/hudsucker.cer");
+    
+    let private_key = PKey::private_key_from_pem(private_key_bytes)?;
+    let ca_cert = X509::from_pem(ca_cert_bytes)?;
 
-fn get_request_body(data: &[u8]) -> String {
-    if let Ok(str_data) = String::from_utf8_lossy(data).to_string().parse::<String>() {
-        if let Some(idx) = str_data.find("\r\n\r\n") {
-            return str_data[idx + 4..].to_string();
-        }
-    }
-    String::new()
+    let ca = OpensslAuthority::new(
+        private_key,
+        ca_cert,
+        MessageDigest::sha256(),
+        1_000,
+        aws_lc_rs::default_provider(),
+    );
+
+    let proxy = Proxy::builder()
+        .with_addr(addr)
+        .with_ca(ca)
+        .with_rustls_client(aws_lc_rs::default_provider())
+        .with_http_handler(ProxyHandler { 
+            weak,
+            start_time: std::time::Instant::now(),
+        })
+        .with_websocket_handler(ProxyHandler { 
+            weak: weak.clone(),
+            start_time: std::time::Instant::now(),
+        })
+        .build()?;
+
+    proxy.start().await?;
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let ca_cert = Arc::new(check_and_install_certificate()?);
     let window = MainWindow::new()?;
     
-    let proxy = Arc::new(Mutex::new(Proxy {
+    let proxy = Arc::new(Mutex::new(ProxyState {
         window: window.as_weak(),
-        listener: None,
         listen_task: Arc::new(Mutex::new(None)),
     }));
 
     let proxy_clone = proxy.clone();
     let weak = window.as_weak();
-    let ca_cert = ca_cert.clone();
     window.on_toggle_listening(move || {
         let proxy = proxy_clone.clone();
         let weak = weak.clone();
-        let ca_cert = ca_cert.clone();
         
         let _ = slint::spawn_local(async move {
             let mut proxy = proxy.lock().await;
@@ -331,7 +250,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         task.abort();
                         println!("已中止监听任务");
                     }
-                    proxy.listener = None;
                     if let Err(e) = set_system_proxy(false, None, false) {
                         eprintln!("还原系统代理失败: {}", e);
                     }
@@ -361,63 +279,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     let addr = SocketAddr::from((ip, 8080));
-                    match TcpListener::bind(addr).await {
-                        Ok(listener) => {
-                            println!("成功绑定端口 8080");
-                            proxy.listener = Some(Arc::new(Mutex::new(listener)));
-                            
-                            // 设置系统代理时使用实际IP
-                            let proxy_ip = if window.get_listen_loopback() {
-                                "127.0.0.1".to_string()
-                            } else {
-                                match local_ip_address::local_ip() {
-                                    Ok(ip) => ip.to_string(),
-                                    Err(_) => "127.0.0.1".to_string(),
-                                }
-                            };
-                            
-                            if let Err(e) = set_system_proxy(true, Some(format!("{}:8080", proxy_ip)), true) {
-                                eprintln!("启用系统代理失败: {}", e);
-                            }
-                            
-                            window.set_is_listening(true);
-                            println!("监听已启动");
-                            
-                            let listener = Arc::clone(proxy.listener.as_ref().unwrap());
-                            let weak = window.as_weak();
-                            let ca_cert = ca_cert.clone();
-                            let task = tokio::spawn(async move {
-                                loop {
-                                    match listener.lock().await.accept().await {
-                                        Ok((mut stream, addr)) => {
-                                            println!("收到新的连接: {}", addr);
-                                            
-                                            // 处理连接
-                                            let addr_clone = addr;
-                                            let ca_cert = ca_cert.clone();
-                                            let weak = weak.clone();  // 在这里克隆
-                                            tokio::spawn(async move {
-                                                if let Err(e) = handle_connection(stream, addr_clone, ca_cert, weak).await {
-                                                    eprintln!("处理连接错误: {}", e);
-                                                }
-                                            });
-                                        }
-                                        Err(e) => {
-                                            eprintln!("接受连接错误: {}", e);
-                                            if e.kind() == std::io::ErrorKind::Other {
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                            proxy.listen_task.lock().await.replace(task);
+                    
+                    let weak = window.as_weak();
+                    let task = tokio::spawn(async move {
+                        if let Err(e) = start_proxy(weak, addr).await {
+                            eprintln!("代理错误: {}", e);
                         }
-                        Err(e) => {
-                            eprintln!("无法启动监听: {}", e);
-                            window.set_is_listening(false);
-                        }
-                    }
+                    });
+                    
+                    proxy.listen_task.lock().await.replace(task);
+                    
+                    window.set_is_listening(true);
+                    println!("监听已启动");
                 }
             }
         });
