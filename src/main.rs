@@ -1,5 +1,4 @@
 use chrono::Local;
-use slint::SharedString;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -7,21 +6,19 @@ use slint::{VecModel, Model, ComponentHandle};
 use winreg::enums::*;
 use winreg::RegKey;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::net::ToSocketAddrs;
-use local_ip_address;
 use std::time::{Instant, Duration};
-use tokio::io::AsyncWriteExt;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     HttpContext, HttpHandler, WebSocketHandler, WebSocketContext,
     builder::ProxyBuilder,
     Body, RequestOrResponse,
+    hyper::{Request, Response},
     Proxy,
+    tokio_tungstenite::tungstenite::Message,
+    rcgen::{KeyPair, CertificateParams},
 };
-use http::{Request, Response};
-use tokio_tungstenite::tungstenite::Message;
 use async_trait::async_trait;
-use tracing::*;
+use std::rc::Rc;
 
 slint::include_modules!();
 
@@ -79,24 +76,20 @@ struct ProxyState {
 
 #[derive(Clone)]
 struct ProxyHandler {
-    weak: slint::Weak<MainWindow>,
-    start_time: std::time::Instant,
+    sender: tokio::sync::mpsc::UnboundedSender<RequestInfo>,
+    start_time: Instant,
 }
 
-#[async_trait::async_trait]
 impl HttpHandler for ProxyHandler {
     async fn handle_request(
         &mut self,
         ctx: &HttpContext,
         req: Request<Body>,
-    ) -> hudsucker::RequestOrResponse {
+    ) -> RequestOrResponse {
         let method = req.method().to_string();
         let url = req.uri().to_string();
-        let host = req.uri().host().unwrap_or("unknown").to_string();
         let headers = format!("{:?}", req.headers());
         
-        // 更新UI
-        let weak = self.weak.clone();
         let request_info = RequestInfo {
             method: method.into(),
             url: url.into(),
@@ -104,7 +97,7 @@ impl HttpHandler for ProxyHandler {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("Unknown")).into(),
             status: "Pending".into(),
-            server_ip: host.into(),
+            server_ip: ctx.client_addr.to_string().into(),
             duration: "0.00s".into(),
             size: "0B".into(),
             timestamp: Local::now().format("%H:%M:%S").to_string().into(),
@@ -116,55 +109,37 @@ impl HttpHandler for ProxyHandler {
             response_body: "".into(),
         };
         
-        slint::invoke_from_event_loop(move || {
-            if let Some(window) = weak.upgrade() {
-                let current_requests = window.get_requests();
-                let vec_model = current_requests.as_any()
-                    .downcast_ref::<VecModel<RequestInfo>>()
-                    .unwrap();
-                let mut vec = (0..vec_model.row_count())
-                    .map(|i| vec_model.row_data(i).unwrap())
-                    .collect::<Vec<_>>();
-                vec.push(request_info);
-                window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
-            }
-        }).unwrap();
-
-        req.into()
+        let _ = self.sender.send(request_info);
+        RequestOrResponse::Request(req)
     }
 
     async fn handle_response(
         &mut self,
-        ctx: &HttpContext,
+        _ctx: &HttpContext,
         res: Response<Body>,
     ) -> Response<Body> {
         let duration = self.start_time.elapsed();
         let status = res.status().to_string();
         let headers = format!("{:?}", res.headers());
         
-        // 更新状态等信息
-        let weak = self.weak.clone();
-        slint::invoke_from_event_loop(move || {
-            if let Some(window) = weak.upgrade() {
-                // 更新最后一个请求的状态
-                let current_requests = window.get_requests();
-                let vec_model = current_requests.as_any()
-                    .downcast_ref::<VecModel<RequestInfo>>()
-                    .unwrap();
-                if let Some(mut last_request) = vec_model.row_data(vec_model.row_count() - 1) {
-                    last_request.status = status.into();
-                    last_request.duration = format!("{:.2}s", duration.as_secs_f32()).into();
-                    last_request.response_headers = headers.into();
-                    // 更新模型
-                    let mut vec = (0..vec_model.row_count() - 1)
-                        .map(|i| vec_model.row_data(i).unwrap())
-                        .collect::<Vec<_>>();
-                    vec.push(last_request);
-                    window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
-                }
-            }
-        }).unwrap();
-
+        let request_info = RequestInfo {
+            method: "".into(),
+            url: "".into(),
+            app: "".into(),
+            status: status.into(),
+            server_ip: "".into(),
+            duration: format!("{:.2}s", duration.as_secs_f32()).into(),
+            size: "0B".into(),
+            timestamp: "".into(),
+            raw_request: "".into(),
+            request_headers: "".into(),
+            request_body: "".into(),
+            raw_response: "".into(),
+            response_headers: headers.into(),
+            response_body: "".into(),
+        };
+        
+        let _ = self.sender.send(request_info);
         res
     }
 }
@@ -191,24 +166,52 @@ fn get_app_name(user_agent: &str) -> String {
     }
 }
 
-async fn start_proxy(weak: slint::Weak<MainWindow>, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_proxy(window: slint::Weak<MainWindow>, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    
+    // 启动UI更新任务
+    let window_clone = window.clone();
+    tokio::spawn(async move {
+        while let Some(request_info) = receiver.recv().await {
+            let window_clone = window_clone.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = window_clone.upgrade() {
+                    let current_requests = window.get_requests();
+                    let vec_model = current_requests.as_any()
+                        .downcast_ref::<VecModel<RequestInfo>>()
+                        .unwrap();
+                    let mut vec = (0..vec_model.row_count())
+                        .map(|i| vec_model.row_data(i).unwrap())
+                        .collect::<Vec<_>>();
+                    vec.push(request_info);
+                    window.set_requests(std::rc::Rc::new(VecModel::from(vec)).into());
+                }
+            });
+        }
+    });
+
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["MITM Proxy CA".to_string()]).unwrap();
+    let ca_cert = params.self_signed(&key_pair).unwrap();
+    
     let ca = RcgenAuthority::new(
-        "MITM Proxy CA",
-        "MITM Proxy",
-        vec!["MITM Proxy Root CA".to_string()],
-        Duration::from_secs(365 * 24 * 60 * 60),
-    )?;
+        key_pair,
+        ca_cert,
+        1_000,
+        hudsucker::rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     let proxy = Proxy::builder()
         .with_addr(addr)
         .with_ca(ca)
+        .with_rustls_client(hudsucker::rustls::crypto::aws_lc_rs::default_provider())
         .with_http_handler(ProxyHandler { 
-            weak,
-            start_time: std::time::Instant::now(),
+            sender: sender.clone(),
+            start_time: Instant::now(),
         })
         .with_websocket_handler(ProxyHandler { 
-            weak: weak.clone(),
-            start_time: std::time::Instant::now(),
+            sender,
+            start_time: Instant::now(),
         })
         .build()?;
 
